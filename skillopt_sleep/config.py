@@ -13,21 +13,24 @@ from __future__ import annotations
 
 import json
 import os
-from dataclasses import dataclass, field, asdict
-from typing import Any, Dict, List, Optional
-
+from dataclasses import dataclass, field
+from typing import Any, Dict, Optional
 
 HOME_STATE_DIR = os.path.expanduser("~/.skillopt-sleep")
 CLAUDE_HOME = os.path.expanduser("~/.claude")
+CODEX_HOME = os.path.expanduser("~/.codex")
 
 
 DEFAULTS: Dict[str, Any] = {
     # ── scope ──────────────────────────────────────────────────────────────
     "claude_home": CLAUDE_HOME,
+    "codex_home": CODEX_HOME,
+    "transcript_source": "claude",  # "claude" | "codex" | "auto"
     "projects": "invoked",        # "invoked" | "all" | [list of abs paths]
     "invoked_project": "",        # filled at runtime (cwd) when projects == "invoked"
     "lookback_hours": 72,         # harvest window when no prior sleep recorded
     # ── budgets ────────────────────────────────────────────────────────────
+    "max_sessions_per_night": 0,     # 0 => derive from max_tasks_per_night
     "max_tasks_per_night": 40,
     "max_tokens_per_night": 400_000,
     "holdout_fraction": 0.34,     # legacy alias for val_fraction
@@ -45,9 +48,12 @@ DEFAULTS: Dict[str, Any] = {
     "evolve_memory": True,        # consolidate CLAUDE.md
     "evolve_skill": True,         # consolidate the managed SKILL.md
     "llm_mine": True,             # use the backend to mine checkable tasks (real backends)
+    "target_task_filter": True,   # when target_skill_path is set, prefer tasks relevant to it
     # ── adoption / safety ──────────────────────────────────────────────────
     "auto_adopt": False,          # default: stage + require explicit `adopt`
     "managed_skill_name": "skillopt-sleep-learned",
+    "target_skill_path": "",      # optional explicit live SKILL.md path
+    "progress": False,            # print stage progress to stderr when enabled
     "redact_secrets": True,
     "seed": 42,
 }
@@ -95,6 +101,10 @@ class SleepConfig:
         return os.path.join(self.data["claude_home"], "projects")
 
     @property
+    def codex_archived_sessions_dir(self) -> str:
+        return os.path.join(self.data["codex_home"], "archived_sessions")
+
+    @property
     def history_path(self) -> str:
         return os.path.join(self.data["claude_home"], "history.jsonl")
 
@@ -103,6 +113,13 @@ class SleepConfig:
         return os.path.join(self.data["claude_home"], "skills")
 
     def managed_skill_path(self) -> str:
+        explicit = self.data.get("target_skill_path", "")
+        if explicit:
+            path = os.path.expanduser(str(explicit))
+            if not os.path.isabs(path):
+                base = self.data.get("invoked_project") or os.getcwd()
+                path = os.path.join(base, path)
+            return os.path.abspath(path)
         return os.path.join(
             self.skills_dir, self.data["managed_skill_name"], "SKILL.md"
         )

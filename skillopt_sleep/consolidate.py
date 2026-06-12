@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from typing import Callable, List, Optional, Tuple
 
 from skillopt_sleep.backend import Backend
 from skillopt_sleep.memory import apply_edits
@@ -36,6 +36,9 @@ class ConsolidationResult:
     rejected_edits: List[EditRecord]
     holdout_baseline: float
     holdout_candidate: float
+    n_train_failures: int = 0
+    n_train_successes: int = 0
+    no_edits_reason: str = ""
 
 
 def _split(tasks: List[TaskRecord]) -> Tuple[List[TaskRecord], List[TaskRecord]]:
@@ -75,6 +78,7 @@ def consolidate(
     evolve_skill: bool = True,
     evolve_memory: bool = True,
     night: int = 1,
+    progress: Optional[Callable[[str], None]] = None,
 ) -> ConsolidationResult:
     """Run one consolidation epoch: reflect -> bounded edit -> gate.
 
@@ -88,15 +92,24 @@ def consolidate(
     train_tasks, val_tasks = _split(tasks)
     gate_off = str(gate_mode).strip().lower() in {"off", "none", "false", "greedy"}
 
+    def log(message: str) -> None:
+        if progress is not None:
+            progress(message)
+
     # ── baseline on the VAL slice (the gate reference) ────────────────────
+    log(f"baseline replay start: val_tasks={len(val_tasks)}")
     base_pairs = replay_batch(backend, val_tasks, skill, memory)
     base_hard, base_soft = aggregate_scores(base_pairs)
     base_score = select_gate_score(base_hard, base_soft, gate_metric, gate_mixed_weight)
+    log(f"baseline replay done: hard={base_hard:.3f} soft={base_soft:.3f}")
 
     # ── reflect over TRAIN-split failures/successes ───────────────────────
+    log(f"train replay start: train_tasks={len(train_tasks)}")
     train_pairs = replay_batch(backend, train_tasks, skill, memory)
     failures = [(t, r) for (t, r) in train_pairs if r.hard < 1.0]
     successes = [(t, r) for (t, r) in train_pairs if r.hard >= 1.0]
+    log(f"train replay done: failures={len(failures)} successes={len(successes)}")
+    no_edits_reason = "no_train_failures" if not failures else ""
 
     cand_skill, cand_memory = skill, memory
     all_applied: List[EditRecord] = []
@@ -105,11 +118,14 @@ def consolidate(
     def _gate_apply(doc: str, edits: List[EditRecord], which: str) -> str:
         nonlocal cand_skill, cand_memory, base_score, all_applied, all_rejected
         if not edits:
+            log(f"{which} reflect produced no edits")
             return doc
         new_doc, applied = apply_edits(doc, edits)
         if not applied:
+            log(f"{which} edits could not be applied")
             return doc
         # score the candidate on the VAL slice
+        log(f"{which} gate replay start: edits={len(applied)}")
         trial_skill = new_doc if which == "skill" else cand_skill
         trial_memory = new_doc if which == "memory" else cand_memory
         pairs = replay_batch(backend, val_tasks, trial_skill, trial_memory)
@@ -119,11 +135,14 @@ def consolidate(
         if gate_off or cand_score > base_score:
             base_score = max(base_score, cand_score)
             all_applied.extend(applied)
+            log(f"{which} gate accepted: score={cand_score:.3f}")
             return new_doc
         all_rejected.extend(applied)
+        log(f"{which} gate rejected: score={cand_score:.3f} <= base={base_score:.3f}")
         return doc
 
     if evolve_skill:
+        log("skill reflect start")
         if rollouts_k > 1:
             # multi-rollout contrastive reflection: run each train task K times
             # and distill a rule from the good-vs-bad contrast (the imagination signal).
@@ -145,24 +164,35 @@ def consolidate(
                 failures, successes, cand_skill, cand_memory,
                 edit_budget=edit_budget, evolve_skill=True, evolve_memory=False,
             )
+        log(f"skill reflect done: edits={len(edits)}")
+        if failures and not edits and not no_edits_reason:
+            no_edits_reason = "skill_reflect_returned_no_edits"
         cand_skill = _gate_apply(cand_skill, edits, "skill")
 
     if evolve_memory:
         # re-evaluate failures under the (possibly improved) skill
+        log("memory replay start")
         train_pairs2 = replay_batch(backend, train_tasks, cand_skill, cand_memory)
         failures2 = [(t, r) for (t, r) in train_pairs2 if r.hard < 1.0]
         successes2 = [(t, r) for (t, r) in train_pairs2 if r.hard >= 1.0]
+        log(f"memory replay done: failures={len(failures2)} successes={len(successes2)}")
+        log("memory reflect start")
         edits_m = backend.reflect(
             failures2, successes2, cand_skill, cand_memory,
             edit_budget=edit_budget, evolve_skill=False, evolve_memory=True,
         )
+        log(f"memory reflect done: edits={len(edits_m)}")
+        if failures2 and not edits_m and not no_edits_reason:
+            no_edits_reason = "memory_reflect_returned_no_edits"
         cand_memory = _gate_apply(cand_memory, edits_m, "memory")
 
     # ── final decision, scored on the VAL slice ───────────────────────────
+    log("final replay start")
     final_pairs = replay_batch(backend, val_tasks, cand_skill, cand_memory)
     final_hard, final_soft = aggregate_scores(final_pairs)
     final_score = select_gate_score(final_hard, final_soft, gate_metric, gate_mixed_weight)
     base_gate_score = select_gate_score(base_hard, base_soft, gate_metric, gate_mixed_weight)
+    log(f"final replay done: score={final_score:.3f} base={base_gate_score:.3f}")
 
     if gate_off:
         # greedy mode: keep whatever edits we applied; report quality movement
@@ -204,4 +234,7 @@ def consolidate(
         rejected_edits=all_rejected,
         holdout_baseline=base_hard,
         holdout_candidate=final_hard,
+        n_train_failures=len(failures),
+        n_train_successes=len(successes),
+        no_edits_reason="" if (all_applied or all_rejected) else no_edits_reason,
     )

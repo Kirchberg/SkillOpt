@@ -10,18 +10,19 @@ CI use. With backend="anthropic" it spends the user's budget for real lift.
 from __future__ import annotations
 
 import os
-import time
+import sys
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from typing import List, Optional
 
 from skillopt_sleep.backend import get_backend
 from skillopt_sleep.config import SleepConfig, load_config
 from skillopt_sleep.consolidate import consolidate
-from skillopt_sleep.harvest import harvest
+from skillopt_sleep.harvest_sources import harvest_for_config
 from skillopt_sleep.memory import ensure_skill_scaffold
 from skillopt_sleep.mine import mine
+from skillopt_sleep.staging import adopt as adopt_staging
+from skillopt_sleep.staging import write_staging
 from skillopt_sleep.state import SleepState, _now_iso
-from skillopt_sleep.staging import write_staging, adopt as adopt_staging
 from skillopt_sleep.types import SessionDigest, SleepReport, TaskRecord
 
 
@@ -47,6 +48,11 @@ def _read(path: str) -> str:
             return f.read()
     except Exception:
         return ""
+
+
+def _progress(cfg: SleepConfig, message: str) -> None:
+    if cfg.get("progress", False):
+        print(f"[sleep] {message}", file=sys.stderr, flush=True)
 
 
 def _render_report_md(report: SleepReport, cfg: SleepConfig) -> str:
@@ -108,6 +114,26 @@ def run_sleep_cycle(
         cfg.get("backend", "mock"),
         model=cfg.get("model", ""),
         codex_path=cfg.get("codex_path", ""),
+        project_dir=project,
+    )
+    _progress(cfg, f"night {night}: project={project} backend={backend.name}")
+
+    # ── live skill/memory docs ───────────────────────────────────────────
+    live_memory_path = os.path.join(project, "CLAUDE.md")
+    live_skill_path = cfg.managed_skill_path()
+    _progress(cfg, f"live skill: {live_skill_path}")
+    raw_skill = _read(live_skill_path)
+    skill = raw_skill
+    memory = _read(live_memory_path)
+    if not skill:
+        skill = ensure_skill_scaffold(
+            "", name=cfg.get("managed_skill_name", "skillopt-sleep-learned"),
+            description="Preferences and procedures learned from past local agent sessions.",
+        )
+    target_filter = bool(
+        cfg.get("target_task_filter", True)
+        and cfg.get("target_skill_path", "")
+        and raw_skill
     )
 
     # ── 1+2. harvest + mine (unless seed_tasks injected) ─────────────────
@@ -115,16 +141,22 @@ def run_sleep_cycle(
     if seed_tasks is not None:
         tasks = seed_tasks
         n_sessions = 0
+        _progress(cfg, f"using {len(tasks)} seeded tasks")
     else:
         since = state.last_harvest_for(project)
-        digests = harvest(
-            cfg.transcripts_dir,
-            scope=cfg.get("projects", "invoked"),
-            invoked_project=cfg.get("invoked_project", ""),
+        max_tasks = cfg.get("max_tasks_per_night", 40)
+        max_sessions = cfg.get("max_sessions_per_night", 0) or max_tasks * 3
+        candidate_limit = max_tasks
+        if target_filter:
+            candidate_limit = max(max_tasks, max_tasks * 3)
+        _progress(cfg, f"harvest start: source={cfg.get('transcript_source')} max_sessions={max_sessions}")
+        digests = harvest_for_config(
+            cfg,
             since_iso=since,
-            limit=cfg.get("max_tasks_per_night", 40) * 3,
+            limit=max_sessions,
         )
         n_sessions = len(digests)
+        _progress(cfg, f"harvest done: sessions={n_sessions}")
         # When a real backend is configured, use it to mine checkable tasks from
         # the transcripts (rubric/rule judges); otherwise fall back to the
         # heuristic miner (no API, no checkable reference).
@@ -132,27 +164,29 @@ def run_sleep_cycle(
         if cfg.get("backend", "mock") != "mock" and cfg.get("llm_mine", True):
             try:
                 from skillopt_sleep.llm_miner import make_llm_miner
-                llm_miner = make_llm_miner(backend, max_tasks=cfg.get("max_tasks_per_night", 40))
+                llm_miner = make_llm_miner(
+                    backend,
+                    max_sessions=max_sessions,
+                    max_tasks=candidate_limit,
+                )
             except Exception:
                 llm_miner = None
+        _progress(
+            cfg,
+            f"mine start: max_tasks={max_tasks} candidate_limit={candidate_limit} "
+            f"llm_mine={llm_miner is not None} target_filter={target_filter}",
+        )
         tasks = mine(
             digests,
-            max_tasks=cfg.get("max_tasks_per_night", 40),
+            max_tasks=max_tasks,
+            candidate_limit=candidate_limit,
             holdout_fraction=cfg.get("holdout_fraction", 0.34),
             seed=cfg.get("seed", 42),
             llm_miner=llm_miner,
+            target_skill_text=raw_skill if target_filter else "",
+            target_skill_path=live_skill_path if target_filter else "",
         )
-
-    # ── live skill/memory docs ───────────────────────────────────────────
-    live_memory_path = os.path.join(project, "CLAUDE.md")
-    live_skill_path = cfg.managed_skill_path()
-    skill = _read(live_skill_path)
-    memory = _read(live_memory_path)
-    if not skill:
-        skill = ensure_skill_scaffold(
-            "", name=cfg.get("managed_skill_name", "skillopt-sleep-learned"),
-            description="Preferences and procedures learned from past Claude Code sessions.",
-        )
+        _progress(cfg, f"mine done: tasks={len(tasks)}")
 
     report = SleepReport(
         night=night, project=project, started_at=started,
@@ -170,6 +204,7 @@ def run_sleep_cycle(
         return CycleOutcome(report, staging_dir, False, [])
 
     # ── 3+4. replay + consolidate (gate) ─────────────────────────────────
+    _progress(cfg, "consolidate start")
     result = consolidate(
         backend, tasks, skill, memory,
         edit_budget=cfg.get("edit_budget", 4),
@@ -179,6 +214,12 @@ def run_sleep_cycle(
         evolve_skill=cfg.get("evolve_skill", True),
         evolve_memory=cfg.get("evolve_memory", True),
         night=night,
+        progress=(lambda m: _progress(cfg, m)),
+    )
+    _progress(
+        cfg,
+        f"consolidate done: gate={result.gate_action} accepted={result.accepted} "
+        f"edits={len(result.applied_edits)} rejected={len(result.rejected_edits)}",
     )
 
     report.n_replayed = len(tasks)
@@ -186,9 +227,15 @@ def run_sleep_cycle(
     report.candidate_score = result.candidate_score
     report.accepted = result.accepted
     report.gate_action = result.gate_action
+    report.no_edits_reason = result.no_edits_reason
     report.edits = result.applied_edits
     report.rejected_edits = result.rejected_edits
     report.tokens_used = backend.tokens_used()
+    if result.no_edits_reason:
+        report.notes.append(
+            f"no edits proposed: {result.no_edits_reason} "
+            f"(train failures={result.n_train_failures}, successes={result.n_train_successes})"
+        )
     report.ended_at = _now_iso(clock)
 
     # ── 5. stage (unless dry-run) ────────────────────────────────────────
@@ -196,6 +243,7 @@ def run_sleep_cycle(
     adopted = False
     adopted_paths: List[str] = []
     if not dry_run:
+        _progress(cfg, "staging start")
         report_md = _render_report_md(report, cfg)
         proposed_skill = result.new_skill if (cfg.get("evolve_skill") and result.accepted) else None
         proposed_memory = result.new_memory if (cfg.get("evolve_memory") and result.accepted) else None
@@ -216,8 +264,10 @@ def run_sleep_cycle(
         })
         # ── 6. adopt (opt-in) ────────────────────────────────────────────
         if cfg.get("auto_adopt") and result.accepted:
+            _progress(cfg, "auto-adopt start")
             adopted_paths = adopt_staging(staging_dir)
             adopted = bool(adopted_paths)
         state.save()
+        _progress(cfg, f"staging done: {staging_dir}")
 
     return CycleOutcome(report, staging_dir, adopted, adopted_paths)

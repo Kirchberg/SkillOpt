@@ -87,6 +87,9 @@ def run(persona: str = "researcher", nights: int = 4, backend_name: str = "mock"
             "n_edits": len(res.applied_edits),
             "edits": [e.content for e in res.applied_edits],
             "n_rejected": len(res.rejected_edits),
+            "n_train_failures": res.n_train_failures,
+            "n_train_successes": res.n_train_successes,
+            "no_edits_reason": res.no_edits_reason,
         })
         # converged: stop early if perfect
         if res.candidate_score >= 0.999:

@@ -67,7 +67,7 @@ Dreams** (offline consolidation; review-then-adopt), and the **agent sleep**
 idea (short-term experience → long-term competence). One "night":
 
 ```
-harvest session transcripts → mine recurring tasks → replay offline
+harvest Claude Code / Codex Desktop transcripts → mine recurring tasks → replay offline
    → consolidate (reflect → bounded edit → GATE on real held-out tasks)
    → stage proposal → (you) adopt
 ```
@@ -77,7 +77,7 @@ harvest session transcripts → mine recurring tasks → replay offline
 | Platform | Folder | Install |
 |---|---|---|
 | **Claude Code** | [`plugins/claude-code`](plugins/claude-code) | `/plugin marketplace add ./plugins/claude-code` → `/sleep` |
-| **Codex** | [`plugins/codex`](plugins/codex) | `bash plugins/codex/install.sh` → `/sleep` |
+| **Codex** | [`plugins/codex`](plugins/codex) | `bash plugins/codex/install.sh` → `skillopt-sleep` skill |
 | **Copilot** | [`plugins/copilot`](plugins/copilot) | register `plugins/copilot/mcp_server.py` as an MCP server |
 
 **Validated on real models.** On the public
@@ -95,6 +95,34 @@ positive, and the gate blocks regressions
 > documented in [`docs/sleep/CONTROLLABLE_DREAMING.md`](docs/sleep/CONTROLLABLE_DREAMING.md).
 
 Deterministic proof (no API key): `python -m skillopt_sleep.experiments.run_experiment --persona researcher --assert-improves`.
+
+For local sleep cycles, transcript source and replay backend are separate knobs:
+use `--source claude` for Claude Code transcripts, `--source codex` for Codex
+Desktop archived sessions under `~/.codex/archived_sessions`, and
+`--backend codex` only when you want the replay/optimizer to spend Codex budget.
+Use `--max-sessions`, `--max-tasks`, and `--progress` for bounded live runs;
+use `--target-skill-path .agents/skills/<name>/SKILL.md` when you want staged
+adoption to target a repo-scoped Codex skill instead of the default managed
+user-level skill. When a target skill is set, SkillOpt-Sleep also over-samples
+mined tasks and prefers tasks whose intent/context matches that skill, so one
+generic failure pool is less likely to drive unrelated skill edits.
+
+For privacy-sensitive projects, export the mined task set first, review or edit
+it locally, then replay only that reviewed file with the real backend:
+
+```bash
+python -m skillopt_sleep harvest --project "$(pwd)" --source codex \
+  --target-skill-path .agents/skills/example/SKILL.md \
+  --max-sessions 5 --max-tasks 3 \
+  --output reviewed-tasks.json
+
+python -m skillopt_sleep dry-run --project "$(pwd)" --backend codex \
+  --tasks-file reviewed-tasks.json --progress --json
+```
+
+Inspect/redact the JSON and set `"reviewed": true` before using a real backend.
+`--tasks-file` skips transcript harvest/mining and replays only the JSON tasks
+you reviewed; real backends refuse task files still marked `"reviewed": false`.
 
 ---
 

@@ -4,6 +4,44 @@ The sleep engine is no longer a single fixed pipeline. It is a controllable
 offline "dream / imagination" loop the user steers. This documents the knobs
 added in the four-stage refactor and how they map to the user's design.
 
+## Transcript sources
+
+Sleep separates the source of past sessions from the backend used to replay and
+optimize tasks:
+
+```bash
+python -m skillopt_sleep dry-run --project "$(pwd)" --source claude --backend mock
+python -m skillopt_sleep dry-run --project "$(pwd)" --source codex --backend mock
+python -m skillopt_sleep run --project "$(pwd)" --source codex --backend codex \
+  --max-sessions 5 --max-tasks 3 --progress
+python -m skillopt_sleep run --project "$(pwd)" --source codex --backend codex \
+  --target-skill-path .agents/skills/example/SKILL.md \
+  --max-sessions 5 --max-tasks 3 --progress
+python -m skillopt_sleep harvest --project "$(pwd)" --source codex \
+  --target-skill-path .agents/skills/example/SKILL.md \
+  --max-sessions 5 --max-tasks 3 --output reviewed-tasks.json
+python -m skillopt_sleep dry-run --project "$(pwd)" --backend codex \
+  --tasks-file reviewed-tasks.json --progress --json
+```
+
+`--source claude` reads Claude Code transcripts from `~/.claude/projects`.
+`--source codex` reads Codex Desktop archives from
+`~/.codex/archived_sessions`. `--source auto` tries Codex archives first, then
+falls back to Claude Code transcripts. Use `--codex-home /path/to/.codex` or
+`--claude-home /path/to/.claude` to point at non-default homes.
+Use `--max-sessions` to cap archived sessions before LLM mining, `--max-tasks`
+to cap mined tasks before replay/consolidation, and `--progress` to print
+stage progress to stderr. Use `--target-skill-path` for repo-scoped Codex
+skills such as `.agents/skills/<name>/SKILL.md`. Target-skill runs over-sample
+candidate tasks before the `--max-tasks` cut and prefer tasks whose
+intent/context overlaps the target skill's path, headings, and content. Use
+`harvest --output reviewed-tasks.json` when you want to inspect or redact the
+target-filtered task set before any real backend sees it, then pass
+`--tasks-file reviewed-tasks.json` to `run` or `dry-run`; task-file runs skip
+transcript harvest/mining and replay only the reviewed JSON tasks. Real
+backends refuse task files still marked `"reviewed": false`; after inspection,
+set `"reviewed": true`.
+
 ## The mental model
 
 > Sleep = an offline imagination rollout. Re-run the user's real

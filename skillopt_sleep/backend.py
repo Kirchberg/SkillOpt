@@ -269,6 +269,8 @@ class CliBackend(Backend):
         self.timeout = timeout
         self._tokens = 0
         self._cache: Dict[str, str] = {}
+        self.last_call_error = ""
+        self.last_reflect_raw = ""
 
     # subclasses override --------------------------------------------------
     def _call(self, prompt: str, *, max_tokens: int = 1024) -> str:
@@ -391,11 +393,14 @@ class CliBackend(Backend):
             )
         prompt = (
             "You are SkillOpt's optimizer. The agent keeps failing the recurring "
-            f"tasks below. Propose at most {edit_budget} bounded edits to the "
+            f"tasks below. Propose 1 to {edit_budget} bounded edits to the "
             f"{target} document so it stops failing. Each edit MUST be a short, "
             "GENERAL, reusable rule or preference (never task-specific, never an "
             "answer to a single task). If exact failing criteria are listed, your "
             "edits MUST make future outputs satisfy every one of them.\n"
+            "Because failures are present, return [] ONLY if the current document "
+            "already explicitly contains rules that satisfy every failing "
+            "criterion. Otherwise return at least one add edit.\n"
             "BE CONCRETE: quote the exact threshold, section name, or format from "
             "the criteria verbatim in your rule (e.g. write 'keep the entire "
             "response under 1200 characters', NOT 'respect length limits'). Vague "
@@ -413,6 +418,33 @@ class CliBackend(Backend):
             f"{pref_text}\n\n"
             f"# Recurring failures\n{fail_text}"
         )
+
+        def _fallback_edits() -> List[EditRecord]:
+            rules: List[str] = []
+            seen: set[str] = set()
+            for t, _r in failures:
+                for tag in t.tags:
+                    if not tag.startswith("rule:"):
+                        continue
+                    key = tag[len("rule:"):]
+                    text = getattr(MockBackend, "RULE_TEXT", {}).get(key)
+                    if text and text not in cur_doc and text not in seen:
+                        seen.add(text)
+                        rules.append(text)
+            if not rules and crit:
+                requirement = "; ".join(_explain(c) for c, _n in crit.most_common())
+                if requirement:
+                    rules.append(f"Always satisfy these output checks exactly: {requirement}.")
+            return [
+                EditRecord(
+                    target=target,
+                    op="add",
+                    content=rule,
+                    rationale="deterministic fallback after the optimizer returned no usable edits",
+                )
+                for rule in rules[:edit_budget]
+            ]
+
         # Call with one retry: transient non-JSON replies otherwise waste a whole
         # night (the gate sees no edits and rejects). A firmer second prompt
         # recovers most of these.
@@ -420,9 +452,12 @@ class CliBackend(Backend):
         for attempt in range(2):
             p = prompt if attempt == 0 else (
                 prompt + "\n\nIMPORTANT: your previous reply was not valid JSON. "
-                "Reply with ONLY the JSON array, no prose, no markdown fences."
+                "Failures are present, so return at least one add edit unless the "
+                "current document already contains the exact missing rule. Reply "
+                "with ONLY the JSON array, no prose, no markdown fences."
             )
             raw = self._call(p, max_tokens=1024)
+            self.last_reflect_raw = raw
             self._tokens += len(p) // 4 + len(raw) // 4
             arr = _extract_json(raw, "array")
             if isinstance(arr, list) and arr:
@@ -442,6 +477,8 @@ class CliBackend(Backend):
                     anchor=str(e.get("anchor", "")).strip(),
                     rationale=str(e.get("rationale", "")).strip(),
                 ))
+        if not edits:
+            edits = _fallback_edits()
         return edits
 
     def tokens_used(self) -> int:
@@ -601,15 +638,25 @@ class CodexCliBackend(CliBackend):
 
     name = "codex"
 
-    def __init__(self, model: str = "", codex_path: str = "", timeout: int = 240,
-                 sandbox: str = "read-only") -> None:
+    def __init__(
+        self,
+        model: str = "",
+        codex_path: str = "",
+        timeout: int = 240,
+        sandbox: str = "read-only",
+        project_dir: str = "",
+    ) -> None:
         super().__init__(model=model or os.environ.get("SKILLOPT_SLEEP_CODEX_MODEL", ""),
                          timeout=timeout)
         self.codex_path = resolve_codex_path(codex_path)
         self.sandbox = sandbox
+        self.project_dir = (
+            os.path.abspath(os.path.expanduser(project_dir)) if project_dir else ""
+        )
 
     def _call(self, prompt: str, *, max_tokens: int = 1024) -> str:
         import tempfile
+        self.last_call_error = ""
         out_path = tempfile.NamedTemporaryFile(
             prefix="codex_last_", suffix=".txt", delete=False
         ).name
@@ -618,18 +665,39 @@ class CodexCliBackend(CliBackend):
             "--color", "never", "--sandbox", self.sandbox,
             "-o", out_path,
         ]
+        if self.project_dir:
+            cmd[3:3] = ["-C", self.project_dir]
         if self.model:
             cmd += ["-m", self.model]
         cmd += ["--", prompt]
+        proc = None
         try:
-            subprocess.run(cmd, capture_output=True, text=True, timeout=self.timeout)
-        except Exception:
-            return ""
-        try:
-            with open(out_path, encoding="utf-8") as f:
-                return f.read().strip()
-        except Exception:
-            return ""
+            try:
+                proc = subprocess.run(
+                    cmd,
+                    capture_output=True,
+                    text=True,
+                    timeout=self.timeout,
+                    cwd=self.project_dir or None,
+                )
+            except subprocess.TimeoutExpired:
+                self.last_call_error = f"codex exec timed out after {self.timeout}s"
+                return ""
+            except Exception as exc:
+                self.last_call_error = f"codex exec failed: {exc}"
+                return ""
+            try:
+                with open(out_path, encoding="utf-8") as f:
+                    out = f.read().strip()
+                if out:
+                    return out
+            except Exception as exc:
+                self.last_call_error = f"could not read codex output file: {exc}"
+            stdout = (proc.stdout or "").strip() if proc is not None else ""
+            stderr = (proc.stderr or "").strip() if proc is not None else ""
+            if proc is not None and proc.returncode != 0 and not self.last_call_error:
+                self.last_call_error = f"codex exec exited {proc.returncode}: {stderr[:500]}"
+            return stdout or stderr
         finally:
             try:
                 os.unlink(out_path)
@@ -747,12 +815,13 @@ def get_backend(
     model: str = "",
     claude_path: str = "claude",
     codex_path: str = "",
+    project_dir: str = "",
 ) -> Backend:
     n = (name or "mock").strip().lower()
     if n in {"claude", "anthropic", "claude_cli", "claude_code"}:
         return ClaudeCliBackend(model=model, claude_path=claude_path)
     if n in {"codex", "codex_cli", "openai_codex"}:
-        return CodexCliBackend(model=model, codex_path=codex_path)
+        return CodexCliBackend(model=model, codex_path=codex_path, project_dir=project_dir)
     return MockBackend()
 
 
@@ -765,6 +834,7 @@ def build_backend(
     target_backend: str = "",
     target_model: str = "",
     codex_path: str = "",
+    project_dir: str = "",
     preferences: str = "",
 ) -> Backend:
     """Build a single or dual backend.
@@ -776,11 +846,26 @@ def build_backend(
     """
     has_split = any([optimizer_backend, optimizer_model, target_backend, target_model])
     if not has_split:
-        be = get_backend(backend, model=model, codex_path=codex_path)
+        be = get_backend(
+            backend,
+            model=model,
+            codex_path=codex_path,
+            project_dir=project_dir,
+        )
         be.preferences = preferences
         return be
-    tgt = get_backend(target_backend or backend, model=target_model or model, codex_path=codex_path)
-    opt = get_backend(optimizer_backend or backend, model=optimizer_model or model, codex_path=codex_path)
+    tgt = get_backend(
+        target_backend or backend,
+        model=target_model or model,
+        codex_path=codex_path,
+        project_dir=project_dir,
+    )
+    opt = get_backend(
+        optimizer_backend or backend,
+        model=optimizer_model or model,
+        codex_path=codex_path,
+        project_dir=project_dir,
+    )
     opt.preferences = preferences  # reflect runs on the optimizer
     dual = DualBackend(target=tgt, optimizer=opt)
     dual.preferences = preferences
