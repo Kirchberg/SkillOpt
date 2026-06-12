@@ -4,7 +4,9 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+CODEX_HOME="${CODEX_HOME:-$HOME/.codex}"
 AGENTS_SKILLS="${HOME}/.agents/skills"
+LEGACY_PROMPT="$CODEX_HOME/prompts/sleep.md"
 
 echo "[install] repo: $REPO_ROOT"
 
@@ -13,11 +15,21 @@ mkdir -p "$AGENTS_SKILLS/skillopt-sleep"
 cp "$REPO_ROOT/plugins/codex/skills/skillopt-sleep/SKILL.md" "$AGENTS_SKILLS/skillopt-sleep/SKILL.md"
 echo "[install] skill           -> $AGENTS_SKILLS/skillopt-sleep/SKILL.md"
 
-# 2) record the repo location so the runner is found from anywhere
+# 2) retire the old custom prompt entrypoint from previous installs
+if [ -f "$LEGACY_PROMPT" ]; then
+  backup="${LEGACY_PROMPT}.skillopt-legacy.bak"
+  if [ -e "$backup" ]; then
+    backup="${LEGACY_PROMPT}.skillopt-legacy.$(date +%Y%m%d%H%M%S).bak"
+  fi
+  mv "$LEGACY_PROMPT" "$backup"
+  echo "[install] legacy prompt  -> $backup"
+fi
+
+# 3) record the repo location so the runner is found from anywhere
 echo "[install] add to your shell profile:"
 echo "    export SKILLOPT_SLEEP_REPO=\"$REPO_ROOT\""
 
-# 3) optional: append an AGENTS.md hint (only if the user opts in)
+# 4) optional: append an AGENTS.md hint (only if the user opts in)
 cat <<EOF
 
 [install] Optional — add this to ~/.codex/AGENTS.md so Codex always knows the tool:

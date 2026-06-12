@@ -28,6 +28,9 @@ bash plugins/codex/install.sh          # installs the skill
 export SKILLOPT_SLEEP_REPO="$(pwd)"    # so the runner is found from anywhere
 ```
 
+If a previous install created `~/.codex/prompts/sleep.md`, the installer moves
+that deprecated prompt aside with a `.skillopt-legacy*.bak` suffix.
+
 Requires Python ≥ 3.10 and the `codex` CLI on PATH.
 
 ## Use
